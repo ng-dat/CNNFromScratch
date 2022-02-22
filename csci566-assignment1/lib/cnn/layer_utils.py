@@ -138,16 +138,20 @@ class ConvLayer2D(object):
         X = np.transpose(input, axes=[0, 3, 1, 2])
         batch_size, input_height, input_width, _ = input.shape
 
-        shape = (self.input_channels, self.kernel_size, self.kernel_size, batch_size, output_height, output_width)
-        strides = (input_height * input_width, input_width, 1, self.input_channels * input_height * input_width, self.stride * input_width, self.stride)
-        strides = input.itemsize * np.array(strides)
-        input_stride = np.lib.stride_tricks.as_strided(input, shape=shape, strides=strides)
-        input_cols = np.ascontiguousarray(input_stride)
-        input_cols.shape = (self.input_channels * self.kernel_size * self.kernel_size, batch_size * output_height * output_width)
+        input_cols = np.zeros((self.input_channels * self.kernel_size * self.kernel_size, batch_size * output_height * output_width))
+        for c in range(self.input_channels):
+            for kernel_h in range(self.kernel_size):
+                for kernel_w in range(self.kernel_size):
+                    row = c * self.kernel_size * self.kernel_size + kernel_h * self.kernel_size + kernel_w
+                    for out_h in range(output_height):
+                        for out_w in range(output_width):
+                            for n in range(batch_size):
+                                col = out_h * output_width * batch_size + out_w * batch_size + n
+                                input_cols[row, col] = X[n, c, self.stride * out_h + kernel_h, self.stride * out_w + kernel_w]
 
         z = W.reshape(self.number_filters, -1).dot(input_cols) + b.reshape(-1, 1)
-        z.shape = (self.number_filters, batch_size, output_height, output_width)
-        output = np.transpose(z, axes=[1, 2, 3, 0])
+        z = z.reshape((self.number_filters, output_height, output_width, batch_size))
+        output = np.transpose(z, axes=[3, 1, 2, 0])
         output = np.ascontiguousarray(output)
 
         self.meta = img
@@ -166,39 +170,46 @@ class ConvLayer2D(object):
         dimg, self.grads[self.w_name], self.grads[self.b_name] = None, None, None
         
         #############################################################################
-        # TODO: Implement the backward pass of a single convolutional layer.        #
+        # TODO: Implement the backward pass of a single convolutional layer.y]        #
         # Store the computed gradients wrt weights and biases in self.grads with    #
         # corresponding name.                                                       #
         # Store the output gradients in the variable dimg provided above.           #
         #############################################################################
-        input = np.pad(img, pad_width=((0,0),(self.padding,self.padding),(self.padding,self.padding),(0,0)))
+        input = np.pad(img, pad_width=((0, 0), (self.padding, self.padding), (self.padding, self.padding), (0, 0)))
         _, output_height, output_width, _ = dprev.shape
         batch_size, input_height, input_width, _ = input.shape
         W = np.transpose(self.params[self.w_name], axes=[3, 2, 0, 1])
+        X = np.transpose(input, axes=[0, 3, 1, 2])
 
         shape = (self.input_channels, self.kernel_size, self.kernel_size, batch_size, output_height, output_width)
         strides = (input_height * input_width, input_width, 1, self.input_channels * input_height * input_width,
                    self.stride * input_width, self.stride)
         strides = img.itemsize * np.array(strides)
-        input_stride = np.lib.stride_tricks.as_strided(input, shape=shape, strides=strides)
+        input_stride = np.lib.stride_tricks.as_strided(X, shape=shape, strides=strides)
         input_cols = np.ascontiguousarray(input_stride)
-        input_cols.shape = (self.input_channels * self.kernel_size * self.kernel_size, batch_size * output_height * output_width)
+        input_cols.shape = (
+        self.input_channels * self.kernel_size * self.kernel_size, batch_size * output_height * output_width)
 
         self.grads[self.b_name] = np.sum(dprev, axis=(0, 1, 2))
-        dprev_reshaped = np.transpose(dprev, axes=[3, 0, 1, 2]).reshape(self.number_filters, -1)
-        dW = dprev_reshaped.dot(input_cols.T).reshape((self.number_filters, self.input_channels, self.kernel_size, self.kernel_size))
+
+        dprev_reshaped = np.transpose(dprev, axes=[3, 1, 2, 0]).reshape(self.number_filters, -1)
+        dW = dprev_reshaped.dot(input_cols.T).reshape(W.shape)
         self.grads[self.w_name] = np.transpose(dW, axes=[2, 3, 1, 0])
 
-        dinput_cols = W.reshape(self.number_filters, -1).T.dot(dprev_reshaped)
-        dinput_cols.shape = shape
-        dimg = np.zeros(input.shape)
-        for n in range(batch_size):
-            for c in range(self.input_channels):
-                for kernel_h in range(self.kernel_size):
-                    for kernel_w in range(self.kernel_size):
-                        for out_h in range(output_height):
-                            for out_w in range(output_width):
-                                dimg[n, self.stride * out_h + kernel_h, self.stride * out_w + kernel_w, c] += dinput_cols[c, kernel_h, kernel_w, n, out_h, out_w]
+        dimg = np.zeros_like(input)
+        self.grads[self.w_name] = np.zeros_like(self.params[self.w_name])
+        self.grads[self.b_name] = np.zeros_like(self.params[self.b_name])
+        for i in range(input.shape[0]):
+            for h in range(output_height):
+                for w in range(output_width):
+                    local_segment = input[i, h * self.stride:h * self.stride + self.kernel_size,
+                                    w * self.stride:w * self.stride + self.kernel_size, :]
+                    for c in range(self.number_filters):
+                        dimg[i, h * self.stride: h * self.stride + self.kernel_size,
+                        w * self.stride: w * self.stride + self.kernel_size, :] += self.params[self.w_name][:, :, :,
+                                                                                   c] * dprev[i, h, w, c]
+                        self.grads[self.w_name][:, :, :, c] += local_segment * dprev[i, h, w, c]
+                        self.grads[self.b_name][c] += dprev[i, h, w, c]
         dimg = dimg[:, self.padding:-self.padding, self.padding: -self.padding, :]
         #############################################################################
         #                             END OF YOUR CODE                              #
